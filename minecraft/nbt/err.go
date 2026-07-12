@@ -120,6 +120,20 @@ func (err IncompatibleTypeError) Error() string {
 
 var errStringTooLong = errors.New("string length exceeds maximum length")
 
+// InvalidLengthError is returned when a negative or otherwise invalid length is
+// encountered while reading from the input stream. This protects against
+// panics and excessive allocations.
+type InvalidLengthError struct {
+	Off int64
+	Op  string
+	N   int
+}
+
+// Error ...
+func (err InvalidLengthError) Error() string {
+	return fmt.Sprintf("nbt: invalid length %v at offset %v during op '%v'", err.N, err.Off, err.Op)
+}
+
 // InvalidStringError is returned if a string read is not valid, meaning it does not exist exclusively out of
 // utf8 characters, or if it is longer than the length prefix can carry.
 type InvalidStringError struct {

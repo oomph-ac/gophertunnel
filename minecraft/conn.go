@@ -22,6 +22,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
+	"github.com/sandertv/go-raknet"
 	"github.com/sandertv/gophertunnel/minecraft/internal"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
@@ -118,6 +119,12 @@ type Conn struct {
 	// packets is a channel of byte slices containing serialised packets that are coming in from the other
 	// side of the connection.
 	packets chan *packetData
+	// batchPackets is a channel of slices of packetData used when batchMode is enabled. Instead of receiving
+	// packets one at a time, packets are received in batches as they arrive from the decoder.
+	batchPackets chan []*packetData
+	// batchMode determines if the connection should use batch packet reading (ReadBatch) instead of
+	// single packet reading (ReadPacket). When true, packets are delivered in batches via batchPackets.
+	batchMode bool
 
 	deferredPacketMu sync.Mutex
 	// deferredPackets is a list of packets that were pushed back during the login sequence because they
@@ -201,6 +208,7 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *slog.Logger, proto Pr
 		dec:          packet.NewDecoder(netConn),
 		salt:         make([]byte, 16),
 		packets:      make(chan *packetData, 8),
+		batchPackets: make(chan []*packetData, 64),
 		additional:   make(chan packet.Packet, 16),
 		spawn:        make(chan struct{}),
 		conn:         netConn,
@@ -216,29 +224,40 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *slog.Logger, proto Pr
 	} else {
 		conn.ctx, conn.cancelFunc = context.WithCancelCause(context.Background())
 	}
-
 	if !limits {
 		// Disable the batch packet limit so that the server can send packets as often as it wants to.
 		conn.dec.DisableBatchPacketLimit()
 	}
 	_, _ = rand.Read(conn.salt)
-
 	conn.expectedIDs.Store([]uint32{packet.IDRequestNetworkSettings})
 
 	if flushRate <= 0 {
 		return conn
 	}
-	go func() {
-		ticker := time.NewTicker(flushRate)
-		defer ticker.Stop()
-		for range ticker.C {
+	go conn.flushRoutine(flushRate)
+	return conn
+}
+
+func (conn *Conn) flushRoutine(d time.Duration) {
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-conn.ctx.Done():
+			return
+		case <-ticker.C:
 			if err := conn.Flush(); err != nil {
 				_ = conn.close(err)
 				return
 			}
 		}
-	}()
-	return conn
+	}
+}
+
+func (conn *Conn) Raknet() *raknet.Conn {
+	c, _ := conn.conn.(*raknet.Conn)
+	return c
 }
 
 // IdentityData returns the identity data of the connection. It holds the UUID, XUID and username of the
@@ -404,6 +423,8 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 //
 // If the packet read was not implemented, a *packet.Unknown is returned, containing the raw payload of the
 // packet read.
+//
+// Note: ReadPacket should not be used when the connection is in batch mode. Use ReadBatch instead.
 func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 	if len(conn.additional) > 0 {
 		return <-conn.additional, nil
@@ -441,6 +462,92 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 			conn.additional <- additional
 		}
 		return pk[0], nil
+	}
+}
+
+// ReadBatch reads a batch of packets from the Conn. Unlike ReadPacket which returns a single packet,
+// ReadBatch returns all packets that were received in a single batch from the remote connection.
+// If a read deadline is set, an error is returned if the deadline is reached before any packets are
+// received. ReadBatch must not be called on multiple goroutines simultaneously.
+//
+// If any packet read was not implemented, a *packet.Unknown is returned for that packet, containing
+// the raw payload of the packet read.
+//
+// Note: ReadBatch should only be used when the connection is in batch mode. Attempting to use ReadBatch
+// when not in batch mode or mixing ReadPacket and ReadBatch calls will result in undefined behavior.
+func (conn *Conn) ReadBatch() ([]packet.Packet, error) {
+	if deferred, ok := conn.takeDeferredPackets(); ok {
+		var packets []packet.Packet
+		for _, data := range deferred {
+			pks, err := data.decode(conn)
+			if err != nil {
+				conn.log.Error("read batch: " + err.Error())
+				continue
+			}
+			packets = append(packets, pks...)
+		}
+		return packets, nil
+	}
+
+	for {
+		select {
+		case <-conn.ctx.Done():
+			return nil, conn.closeErr("read batch")
+		case <-conn.readDeadline:
+			return nil, conn.wrap(context.DeadlineExceeded, "read batch")
+		case batch := <-conn.batchPackets:
+			if len(batch) == 0 {
+				continue
+			}
+
+			var packets []packet.Packet
+			for _, data := range batch {
+				pks, err := data.decode(conn)
+				if err != nil {
+					conn.log.Error("read batch: " + err.Error())
+					continue
+				}
+				packets = append(packets, pks...)
+			}
+			return packets, nil
+		}
+	}
+}
+
+// ReadBatchBytes reads a batch of raw packet data from the connection without decoding them directly.
+// Unlike ReadBytes which returns a single packet's raw bytes, ReadBatchBytes returns all raw packet
+// data that were received in a single batch from the remote connection.
+// For direct packet decoding, consider using ReadBatch() which decodes the packets.
+//
+// Note: ReadBatchBytes should only be used when the connection is in batch mode. Attempting to use
+// ReadBatchBytes when not in batch mode or mixing single-packet and batch methods will result in
+// undefined behavior.
+func (conn *Conn) ReadBatchBytes() ([][]byte, error) {
+	if data, ok := conn.takeDeferredPackets(); ok {
+		packets := make([][]byte, 0, len(data))
+		for _, data := range data {
+			packets = append(packets, data.full)
+		}
+		return packets, nil
+	}
+
+	for {
+		select {
+		case <-conn.ctx.Done():
+			return nil, conn.closeErr("read batch bytes")
+		case <-conn.readDeadline:
+			return nil, conn.wrap(context.DeadlineExceeded, "read batch bytes")
+		case batch := <-conn.batchPackets:
+			if len(batch) == 0 {
+				continue
+			}
+
+			packets := make([][]byte, 0, len(batch))
+			for _, data := range batch {
+				packets = append(packets, data.full)
+			}
+			return packets, nil
+		}
 	}
 }
 
@@ -542,6 +649,141 @@ func (conn *Conn) Flush() error {
 	return nil
 }
 
+// FlushSingleWithACK encodes a batch with a single packet specified to avoid flushing the current buffered send.
+func (conn *Conn) FlushSingleWithACK(pk packet.Packet, ackID uint64) error {
+	select {
+	case <-conn.ctx.Done():
+		return conn.closeErr("write packet")
+	default:
+	}
+	conn.encMu.Lock()
+	defer conn.encMu.Unlock()
+
+	conn.sendMu.Lock()
+	defer conn.sendMu.Unlock()
+
+	buf := internal.BufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		// Reset the buffer, so we can return it to the buffer pool safely.
+		buf.Reset()
+		internal.BufferPool.Put(buf)
+	}()
+
+	conn.hdr.PacketID = pk.ID()
+	_ = conn.hdr.Write(buf)
+	l := buf.Len()
+
+	thisBufferedSend := make([][]byte, 0, 1)
+	for _, converted := range conn.proto.ConvertFromLatest(pk, conn) {
+		converted.Marshal(conn.proto.NewWriter(buf, conn.shieldID.Load()))
+
+		if conn.packetFunc != nil {
+			conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
+		}
+		thisBufferedSend = append(thisBufferedSend, append([]byte(nil), buf.Bytes()...))
+	}
+
+	if len(thisBufferedSend) > 0 {
+		if err := conn.enc.EncodeWithACK(thisBufferedSend, ackID); err != nil && !errors.Is(err, net.ErrClosed) {
+			// Should never happen.
+			panic(fmt.Errorf("error encoding packet batch: %w", err))
+		}
+	}
+	return nil
+}
+
+func (conn *Conn) FlushWithACK(ackID uint64) error {
+	select {
+	case <-conn.ctx.Done():
+		return conn.closeErr("flush")
+	default:
+	}
+	return conn.flushWith(func(packets [][]byte) error {
+		return conn.enc.EncodeWithACK(packets, ackID)
+	})
+}
+
+func (conn *Conn) FlushWithReliability(reliability byte) error {
+	select {
+	case <-conn.ctx.Done():
+		return conn.closeErr("flush")
+	default:
+	}
+
+	return conn.flushWith(func(packets [][]byte) error {
+		return conn.enc.EncodeWithReliability(packets, reliability)
+	})
+}
+
+func (conn *Conn) flushWith(encode func([][]byte) error) error {
+	conn.encMu.Lock()
+	defer conn.encMu.Unlock()
+
+	conn.sendMu.Lock()
+	if len(conn.bufferedSend) == 0 {
+		conn.sendMu.Unlock()
+		return nil
+	}
+	toSend := conn.bufferedSend
+	conn.bufferedSend = conn.bufferedSendSpare[:0]
+	conn.bufferedSendSpare = nil
+	conn.sendMu.Unlock()
+
+	if err := encode(toSend); err != nil && !errors.Is(err, net.ErrClosed) {
+		panic(fmt.Errorf("error encoding packet batch: %w", err))
+	}
+	for i := range toSend {
+		toSend[i] = nil
+	}
+
+	conn.sendMu.Lock()
+	conn.bufferedSendSpare = toSend[:0]
+	conn.sendMu.Unlock()
+	return nil
+}
+
+func (conn *Conn) FlushSingleWithReliability(pk packet.Packet, reliability byte) error {
+	select {
+	case <-conn.ctx.Done():
+		return conn.closeErr("write packet")
+	default:
+	}
+	conn.encMu.Lock()
+	defer conn.encMu.Unlock()
+
+	conn.sendMu.Lock()
+	defer conn.sendMu.Unlock()
+
+	buf := internal.BufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		// Reset the buffer, so we can return it to the buffer pool safely.
+		buf.Reset()
+		internal.BufferPool.Put(buf)
+	}()
+
+	conn.hdr.PacketID = pk.ID()
+	_ = conn.hdr.Write(buf)
+	l := buf.Len()
+
+	thisBufferedSend := make([][]byte, 0, 1)
+	for _, converted := range conn.proto.ConvertFromLatest(pk, conn) {
+		converted.Marshal(conn.proto.NewWriter(buf, conn.shieldID.Load()))
+
+		if conn.packetFunc != nil {
+			conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
+		}
+		thisBufferedSend = append(thisBufferedSend, append([]byte(nil), buf.Bytes()...))
+	}
+
+	if len(thisBufferedSend) > 0 {
+		if err := conn.enc.EncodeWithReliability(thisBufferedSend, reliability); err != nil && !errors.Is(err, net.ErrClosed) {
+			// Should never happen.
+			panic(fmt.Errorf("error encoding packet batch: %w", err))
+		}
+	}
+	return nil
+}
+
 // Close closes the Conn and its underlying connection. Before closing, it also calls Flush() so that any
 // packets currently pending are sent out.
 func (conn *Conn) Close() error {
@@ -568,7 +810,7 @@ func (conn *Conn) SetDeadline(t time.Time) error {
 // Passing an empty time.Time to the method (time.Time{}) results in the read deadline being cleared.
 func (conn *Conn) SetReadDeadline(t time.Time) error {
 	empty := time.Time{}
-	if t == empty {
+	if t.Equal(empty) {
 		conn.readDeadline = make(chan time.Time)
 	} else if t.Before(time.Now()) {
 		panic(fmt.Errorf("error setting read deadline: time passed is before time.Now()"))
@@ -632,11 +874,21 @@ func (conn *Conn) takeDeferredPacket() (*packetData, bool) {
 	return data, true
 }
 
-// deferPacket defers a packet so that it is obtained in the next ReadPacket call
-func (conn *Conn) deferPacket(pk *packetData) {
+func (conn *Conn) takeDeferredPackets() ([]*packetData, bool) {
 	conn.deferredPacketMu.Lock()
-	conn.deferredPackets = append(conn.deferredPackets, pk)
-	conn.deferredPacketMu.Unlock()
+	defer conn.deferredPacketMu.Unlock()
+
+	if len(conn.deferredPackets) == 0 {
+		return nil, false
+	}
+	data := slices.Clone(conn.deferredPackets)
+	conn.deferredPackets = nil
+	return data, true
+}
+
+// deferPacket defers a packet so that it is obtained in the next ReadPacket call
+func (conn *Conn) deferPacket(_ *packetData) {
+	// Drop packets that arrive out of sequence instead of retaining attacker-controlled data during login.
 }
 
 // receive receives an incoming serialised packet from the underlying connection. If the connection is not yet
@@ -666,11 +918,76 @@ func (conn *Conn) receive(data []byte) error {
 		}
 		select {
 		case <-conn.ctx.Done():
+			return context.Cause(conn.ctx)
 		case conn.packets <- pkData:
 		}
 		return nil
 	}
 	return conn.handle(pkData)
+}
+
+// receiveMultiple processes multiple incoming serialised packets from the underlying connection.
+// When the connection is past login and batch mode is enabled, the packets are grouped and forwarded
+// over the batchPackets channel. Otherwise, packets are processed individually using receive().
+func (conn *Conn) receiveMultiple(frames [][]byte) error {
+	if conn.batchMode {
+		var batch []*packetData
+		// Process each frame: handle expected login packets internally, forward others in a batch.
+		for _, data := range frames {
+			pkData, err := parseData(data, conn)
+			if err != nil {
+				// Log and continue to attempt processing the rest of the batch.
+				conn.log.Error(err.Error())
+				continue
+			}
+			if pkData.h.PacketID == packet.IDDisconnect {
+				// Handle disconnect packets immediately and close the connection.
+				pks, err := pkData.decode(conn)
+				if err == nil && len(pks) > 0 {
+					_ = conn.close(conn.closeErr(pks[0].(*packet.Disconnect).Message))
+				}
+				return nil
+			}
+
+			// Determine if this packet is part of the expected login sequence. If so, handle it now.
+			expected := false
+			for _, id := range conn.expectedIDs.Load().([]uint32) {
+				if id == pkData.h.PacketID {
+					expected = true
+					break
+				}
+			}
+			if expected {
+				pks, err := pkData.decode(conn)
+				if err != nil {
+					return err
+				}
+				if err := conn.handleMultiple(pks); err != nil {
+					return err
+				}
+				continue
+			}
+
+			// Not an expected packet: Forward to the batch for user consumption.
+			batch = append(batch, pkData)
+		}
+		if len(batch) > 0 {
+			select {
+			case <-conn.ctx.Done():
+				return context.Cause(conn.ctx)
+			case conn.batchPackets <- batch:
+			}
+		}
+		return nil
+	}
+
+	// Non-batch mode: process frames individually.
+	for _, data := range frames {
+		if err := conn.receive(data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // handle tries to handle the incoming packetData.

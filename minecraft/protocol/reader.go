@@ -20,10 +20,7 @@ import (
 // has one passed to it.
 // Reader's uses should always be encapsulated with a deferred recovery. Reader panics on invalid data.
 type Reader struct {
-	r interface {
-		io.Reader
-		io.ByteReader
-	}
+	r             *bytes.Buffer
 	shieldID      int32
 	limitsEnabled bool
 	buf           [8]byte
@@ -34,7 +31,7 @@ func NewReader(r interface {
 	io.Reader
 	io.ByteReader
 }, shieldID int32, enableLimits bool) *Reader {
-	return &Reader{r: r, shieldID: shieldID, limitsEnabled: enableLimits}
+	return &Reader{r: r.(*bytes.Buffer), shieldID: shieldID, limitsEnabled: enableLimits}
 }
 
 // Uint8 reads a uint8 from the underlying buffer.
@@ -63,7 +60,10 @@ func (r *Reader) Bool(x *bool) {
 }
 
 // errStringTooLong is an error set if a string decoded using the String method has a length that is too long.
-var errStringTooLong = errors.New("string length overflows a 32-bit integer")
+var (
+	errStringTooLong     = errors.New("string length overflows a 32-bit integer")
+	errStringOutOfBounds = errors.New("string length exceeds the remaining buffer length")
+)
 
 // StringUTF ...
 func (r *Reader) StringUTF(x *string) {
@@ -72,6 +72,11 @@ func (r *Reader) StringUTF(x *string) {
 	l := int(length)
 	if l > math.MaxInt16 {
 		r.panic(errStringTooLong)
+		return
+	}
+	if r.r.Len() < l {
+		r.panic(errStringOutOfBounds)
+		return
 	}
 	r.checkRemaining(l, "string")
 	data := make([]byte, l)
@@ -85,12 +90,13 @@ func (r *Reader) StringUTF(x *string) {
 func (r *Reader) String(x *string) {
 	var length uint32
 	r.Varuint32(&length)
-	l := int(length)
-	if l > math.MaxInt32 {
+	stringLen := int(length)
+	if stringLen > math.MaxInt32 {
 		r.panic(errStringTooLong)
+		return
 	}
-	r.checkRemaining(l, "string")
-	data := make([]byte, l)
+	r.checkRemaining(stringLen, "string")
+	data := make([]byte, stringLen)
 	if _, err := r.r.Read(data); err != nil {
 		r.panic(err)
 	}
@@ -104,6 +110,11 @@ func (r *Reader) ByteSlice(x *[]byte) {
 	l := int(length)
 	if l > math.MaxInt32 {
 		r.panic(errStringTooLong)
+		return
+	}
+	if r.r.Len() < l {
+		r.panic(errStringOutOfBounds)
+		return
 	}
 	r.checkRemaining(l, "byte slice")
 	data := make([]byte, l)
@@ -741,8 +752,8 @@ func (r *Reader) SliceLength(value uint32, max uint32) {
 	if value > max && r.limitsEnabled {
 		r.panicf("slice length was too long: length of %v (max %v)", value, max)
 	}
-	if remaining, ok := r.r.(interface{ Len() int }); ok && uint64(value) > uint64(remaining.Len()) {
-		r.panicf("slice length %v exceeds remaining packet payload %v", value, remaining.Len())
+	if uint64(value) > uint64(r.r.Len()) {
+		r.panicf("slice length %v exceeds remaining packet payload %v", value, r.r.Len())
 	}
 }
 
@@ -751,8 +762,8 @@ func (r *Reader) checkRemaining(length int, field string) {
 	if length < 0 {
 		r.panicf("%s length was negative: %v", field, length)
 	}
-	if remaining, ok := r.r.(interface{ Len() int }); ok && length > remaining.Len() {
-		r.panicf("%s length %v exceeds remaining packet payload %v", field, length, remaining.Len())
+	if length > r.r.Len() {
+		r.panicf("%s length %v exceeds remaining packet payload %v", field, length, r.r.Len())
 	}
 }
 

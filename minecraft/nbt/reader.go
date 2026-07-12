@@ -1,15 +1,16 @@
 package nbt
 
 import (
+	"bytes"
 	"io"
 )
 
 // offsetReader is a wrapper around an io.Reader, used to track the offset (amount of bytes read) of the data
 // that is being read, so that errors may have offset data.
 type offsetReader struct {
-	io.Reader
-	off int64
-	buf [8]byte
+	Reader *bytes.Buffer
+	off    int64
+	buf    [8]byte
 
 	// ReadByte is a function provided by offsetReader if the io.Reader does not implement io.ByteReader.
 	ReadByte func() (byte, error)
@@ -20,16 +21,22 @@ type offsetReader struct {
 // newOffsetReader returns a new offset reader for the io.Reader passed, setting the ReadByte and Next
 // functions as appropriate for that particular reader.
 func newOffsetReader(r io.Reader) *offsetReader {
-	reader := &offsetReader{Reader: r}
+	reader := &offsetReader{Reader: r.(*bytes.Buffer)}
 	if byteReader, ok := r.(io.ByteReader); ok {
 		reader.ReadByte = func() (byte, error) {
-			reader.off++
-			return byteReader.ReadByte()
+			b, err := byteReader.ReadByte()
+			if err == nil {
+				reader.off++
+			}
+			return b, err
 		}
 	} else {
 		reader.ReadByte = func() (byte, error) {
 			data := make([]byte, 1)
-			_, err := io.ReadAtLeast(reader, data, 1)
+			n, err := io.ReadAtLeast(reader, data, 1)
+			if n == 1 && err == nil {
+				reader.off++
+			}
 			return data[0], err
 		}
 	}

@@ -110,6 +110,13 @@ type ListenConfig struct {
 	// the default value is 16MB (16 * 1024 * 1024). Setting this to a negative integer disables the limit.
 	MaxDecompressedLen int
 
+	// EnableBatchReading, if set to true, enables batch packet reading mode for all connections accepted
+	// by this listener. When enabled, use Conn.ReadBatch() instead of Conn.ReadPacket() to receive packets.
+	// ReadBatch() returns all packets received in a single batch from the remote connection, which can
+	// improve performance for high-throughput scenarios. Do not mix ReadPacket() and ReadBatch() calls
+	// on the same connection.
+	EnableBatchReading bool
+
 	// Allow filters what connections are allowed to connect to the Server. The
 	// address, identity data, and client data of the connection are passed. If
 	// Allow returns false, the connection is closed with the string returned as
@@ -429,6 +436,7 @@ func (listener *Listener) createConn(netConn net.Conn) {
 	conn.verifier = listener.verifier
 	conn.disconnectOnUnknownPacket = !listener.cfg.AllowUnknownPackets
 	conn.disconnectOnInvalidPacket = !listener.cfg.AllowInvalidPackets
+	conn.batchMode = listener.cfg.EnableBatchReading
 
 	if listener.playerCount.Load() == int32(listener.cfg.MaximumPlayers) && listener.cfg.MaximumPlayers != 0 {
 		// The server was full. We kick the player immediately and close the connection.
@@ -469,23 +477,22 @@ func (listener *Listener) handleConn(conn *Conn) {
 			}
 			return
 		}
-		for _, data := range packets {
-			loggedInBefore := conn.loggedIn
-			if err := conn.receive(data); err != nil {
-				conn.log.Error(err.Error())
+
+		loggedInBefore := conn.loggedIn
+		if err := conn.receiveMultiple(packets); err != nil {
+			conn.log.Error(err.Error())
+			return
+		}
+		if !loggedInBefore && conn.loggedIn {
+			select {
+			case <-listener.close:
+				// The listener was closed while this one was logged in, so the incoming channel will be
+				// closed. Just return so the connection is closed and cleaned up.
 				return
-			}
-			if !loggedInBefore && conn.loggedIn {
-				select {
-				case <-listener.close:
-					// The listener was closed while this one was logged in, so the incoming channel will be
-					// closed. Just return so the connection is closed and cleaned up.
-					return
-				case listener.incoming <- conn:
-					// The connection was previously not logged in, but was after receiving this packet,
-					// meaning the connection is fully completely now. We add it to the channel so that
-					// a call to Accept() can receive it.
-				}
+			case listener.incoming <- conn:
+				// The connection was previously not logged in, but was after receiving this packet,
+				// meaning the connection is fully completely now. We add it to the channel so that
+				// a call to Accept() can receive it.
 			}
 		}
 	}

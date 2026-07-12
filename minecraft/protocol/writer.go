@@ -21,10 +21,7 @@ import (
 // Writer implements methods where values are passed using a pointer, so that Reader and Writer have a
 // synonymous interface and both implement the IO interface.
 type Writer struct {
-	w interface {
-		io.Writer
-		io.ByteWriter
-	}
+	w        *bytes.Buffer
 	shieldID int32
 	buf      [8]byte
 }
@@ -34,18 +31,7 @@ func NewWriter(w interface {
 	io.Writer
 	io.ByteWriter
 }, shieldID int32) *Writer {
-	writer := new(Writer)
-	writer.Reset(w, shieldID)
-	return writer
-}
-
-// Reset reuses w with a new underlying destination and shield ID.
-func (w *Writer) Reset(dst interface {
-	io.Writer
-	io.ByteWriter
-}, shieldID int32) {
-	w.w = dst
-	w.shieldID = shieldID
+	return &Writer{w: w.(*bytes.Buffer), shieldID: shieldID}
 }
 
 // Uint8 writes a uint8 to the underlying buffer.
@@ -77,18 +63,9 @@ func (w *Writer) String(x *string) {
 	w.writeString(*x)
 }
 
-// stringWriter is implemented by writers that support writing strings directly.
-type stringWriter interface {
-	WriteString(string) (int, error)
-}
-
-// writeString uses WriteString when available to avoid converting s to []byte.
+// writeString writes s directly to the underlying byte buffer.
 func (w *Writer) writeString(s string) {
-	if sw, ok := w.w.(stringWriter); ok {
-		_, _ = sw.WriteString(s)
-		return
-	}
-	_, _ = w.w.Write([]byte(s))
+	_, _ = w.w.WriteString(s)
 }
 
 // ByteSlice writes a []byte, prefixed with a varuint32, to the underlying buffer.

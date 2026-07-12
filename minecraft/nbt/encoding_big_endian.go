@@ -4,6 +4,7 @@ package nbt
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"unsafe"
 )
@@ -127,6 +128,12 @@ func (e bigEndian) String(r *offsetReader) (string, error) {
 	if err != nil {
 		return "", BufferOverrunError{Op: "String"}
 	}
+	if n < 0 {
+		return "", InvalidStringError{Off: r.off, N: uint(uint16(n)), Err: errors.New("negative length")}
+	}
+	if int(n) > maxStringSize {
+		return "", InvalidStringError{Off: r.off, N: uint(uint16(n)), Err: errStringTooLong}
+	}
 	b := make([]byte, uint16(n))
 	if _, err := r.Read(b); err != nil {
 		return "", BufferOverrunError{Op: "String"}
@@ -140,7 +147,12 @@ func (e bigEndian) Int32Slice(r *offsetReader) ([]int32, error) {
 	if err != nil {
 		return nil, BufferOverrunError{Op: "Int32Slice"}
 	}
-	b := make([]byte, n*4)
+	if n < 0 {
+		return nil, InvalidLengthError{Off: r.off, Op: "Int32Slice", N: int(n)}
+	} else if minCap := int(n) * 4; r.Reader.Len() < minCap {
+		return nil, BufferOverrunError{Op: "Int32Slice"}
+	}
+	b := make([]byte, int(n)*4)
 	if _, err := r.Read(b); err != nil {
 		return nil, BufferOverrunError{Op: "Int32Slice"}
 	}
@@ -156,7 +168,12 @@ func (e bigEndian) Int64Slice(r *offsetReader) ([]int64, error) {
 	if err != nil {
 		return nil, BufferOverrunError{Op: "Int64Slice"}
 	}
-	b := make([]byte, n*8)
+	if n < 0 {
+		return nil, InvalidLengthError{Off: r.off, Op: "Int64Slice", N: int(n)}
+	} else if minCap := int(n) * 8; r.Reader.Len() < minCap {
+		return nil, BufferOverrunError{Op: "Int64Slice"}
+	}
+	b := make([]byte, int(n)*8)
 	if _, err := r.Read(b); err != nil {
 		return nil, BufferOverrunError{Op: "Int64Slice"}
 	}
@@ -285,6 +302,12 @@ func (e littleEndian) String(r *offsetReader) (string, error) {
 	if err != nil {
 		return "", BufferOverrunError{Op: "String"}
 	}
+	if strLen < 0 {
+		return "", InvalidStringError{Off: r.off, N: uint(uint16(strLen)), Err: errors.New("negative length")}
+	}
+	if int(strLen) > maxStringSize {
+		return "", InvalidStringError{Off: r.off, N: uint(uint16(strLen)), Err: errStringTooLong}
+	}
 	b := make([]byte, uint16(strLen))
 	if _, err := r.Read(b); err != nil {
 		return "", BufferOverrunError{Op: "String"}
@@ -298,7 +321,12 @@ func (e littleEndian) Int32Slice(r *offsetReader) ([]int32, error) {
 	if err != nil {
 		return nil, BufferOverrunError{Op: "Int32Slice"}
 	}
-	b := make([]byte, n*4)
+	if n < 0 {
+		return nil, InvalidLengthError{Off: r.off, Op: "Int32Slice", N: int(n)}
+	} else if minCap := int(n) * 4; r.Reader.Len() < minCap {
+		return nil, BufferOverrunError{Op: "Int32Slice"}
+	}
+	b := make([]byte, int(n)*4)
 	if _, err := r.Read(b); err != nil {
 		return nil, BufferOverrunError{Op: "Int32Slice"}
 	}
@@ -320,7 +348,12 @@ func (e littleEndian) Int64Slice(r *offsetReader) ([]int64, error) {
 	if err != nil {
 		return nil, BufferOverrunError{Op: "Int64Slice"}
 	}
-	b := make([]byte, n*8)
+	if n < 0 {
+		return nil, InvalidLengthError{Off: r.off, Op: "Int64Slice", N: int(n)}
+	} else if minCap := int(n) * 8; r.Reader.Len() < minCap {
+		return nil, BufferOverrunError{Op: "Int64Slice"}
+	}
+	b := make([]byte, int(n)*8)
 	if _, err := r.Read(b); err != nil {
 		return nil, BufferOverrunError{Op: "Int64Slice"}
 	}

@@ -23,12 +23,21 @@ type Encoder struct {
 func NewEncoder(w io.Writer) *Encoder {
 	var writer *offsetWriter
 	if byteWriter, ok := w.(io.ByteWriter); ok {
-		writer = &offsetWriter{Writer: w, WriteByte: byteWriter.WriteByte}
+		writer = &offsetWriter{Writer: w}
+		writer.WriteByte = func(b byte) error {
+			if err := byteWriter.WriteByte(b); err != nil {
+				return err
+			}
+			writer.off++
+			return nil
+		}
 	} else {
-		writer = &offsetWriter{Writer: w, WriteByte: func(b byte) error {
-			_, err := w.Write([]byte{b})
+		writer = &offsetWriter{Writer: w}
+		writer.WriteByte = func(b byte) error {
+			// Ensure offset is tracked via offsetWriter.Write
+			_, err := writer.Write([]byte{b})
 			return err
-		}}
+		}
 	}
 	return &Encoder{w: writer, Encoding: NetworkLittleEndian}
 }

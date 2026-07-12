@@ -43,3 +43,5 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.10.0 // indirect
 )
+
+replace github.com/sandertv/go-raknet => github.com/oomph-ac/go-raknet v0.0.0-20260712222913-5b060358d845

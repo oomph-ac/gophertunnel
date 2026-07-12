@@ -70,6 +70,36 @@ func (encoder *Encoder) EnableCompression(compression Compression, threshold int
 // Encode encodes the packets passed. It writes all of them as a single packet which is  compressed and
 // optionally encrypted.
 func (encoder *Encoder) Encode(packets [][]byte) error {
+	return encoder.encode(packets, encoder.w.Write)
+}
+
+// EncodeWithACK encodes the packets passed and writes them with an acknowledgement ID.
+func (encoder *Encoder) EncodeWithACK(packets [][]byte, ackID uint64) error {
+	w, ok := encoder.w.(interface {
+		WriteWithACK([]byte, uint64) (int, error)
+	})
+	if !ok {
+		return fmt.Errorf("write batch with acknowledgement: transport does not support acknowledgements")
+	}
+	return encoder.encode(packets, func(data []byte) (int, error) {
+		return w.WriteWithACK(data, ackID)
+	})
+}
+
+// EncodeWithReliability encodes the packets passed and writes them using the specified RakNet reliability.
+func (encoder *Encoder) EncodeWithReliability(packets [][]byte, reliability byte) error {
+	w, ok := encoder.w.(interface {
+		WriteWithReliability([]byte, byte) (int, error)
+	})
+	if !ok {
+		return fmt.Errorf("write batch with reliability: transport does not support custom reliability")
+	}
+	return encoder.encode(packets, func(data []byte) (int, error) {
+		return w.WriteWithReliability(data, reliability)
+	})
+}
+
+func (encoder *Encoder) encode(packets [][]byte, write func([]byte) (int, error)) error {
 	buf := internal.BufferPool.Get().(*bytes.Buffer)
 	var compressedBuf *bytes.Buffer
 	defer func() {
@@ -134,7 +164,7 @@ func (encoder *Encoder) Encode(packets [][]byte) error {
 		data = slices.Grow(data, 8)
 		data = encoder.encrypt.encrypt(data)
 	}
-	if _, err := encoder.w.Write(data); err != nil {
+	if _, err := write(data); err != nil {
 		return fmt.Errorf("write batch: %w", err)
 	}
 	return nil

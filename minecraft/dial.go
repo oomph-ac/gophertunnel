@@ -116,6 +116,12 @@ type Dialer struct {
 	// (pre-1.21.90) when connecting to the server. This should only be used for outdated
 	// servers, as enabling it will cause compatibility issues with updated servers.
 	EnableLegacyAuth bool
+
+	// EnableBatchReading, if set to true, enables batch packet reading mode. When enabled, use
+	// Conn.ReadBatch() instead of Conn.ReadPacket() to receive packets. ReadBatch() returns all
+	// packets received in a single batch from the remote connection, which can improve performance
+	// for high-throughput scenarios. Do not mix ReadPacket() and ReadBatch() calls on the same connection.
+	EnableBatchReading bool
 }
 
 // Dial dials a Minecraft connection to the address passed over the network passed. The network is typically
@@ -253,6 +259,7 @@ func (d Dialer) DialContextNetwork(ctx context.Context, network Network, address
 	conn.disconnectOnInvalidPacket = d.DisconnectOnInvalidPackets
 	conn.disconnectOnUnknownPacket = d.DisconnectOnUnknownPackets
 	conn.maxDecompressedLen = math.MaxInt
+	conn.batchMode = d.EnableBatchReading
 
 	defaultIdentityData(&conn.identityData)
 	defaultClientData(address, conn.identityData.DisplayName, &conn.clientData)
@@ -373,27 +380,26 @@ func listenConn(conn *Conn, readyForLogin, connected chan struct{}, cancel conte
 			}
 			return
 		}
-		for _, data := range packets {
-			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
-			if err := conn.receive(data); err != nil {
-				if cancelContext {
-					cancel(err)
-				} else {
-					conn.log.Error(err.Error())
-				}
-				return
+
+		loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
+		if err := conn.receiveMultiple(packets); err != nil {
+			if cancelContext {
+				cancel(err)
+			} else {
+				conn.log.Error(err.Error())
 			}
-			if !readyToLoginBefore && conn.readyToLogin {
-				// This is the signal that the connection is ready to login, so we put a value in the channel so that
-				// it may be detected.
-				readyForLogin <- struct{}{}
-			}
-			if !loggedInBefore && conn.loggedIn {
-				// This is the signal that the connection was considered logged in, so we put a value in the channel so
-				// that it may be detected.
-				cancelContext = false
-				connected <- struct{}{}
-			}
+			return
+		}
+		if !readyToLoginBefore && conn.readyToLogin {
+			// This is the signal that the connection is ready to login, so we put a value in the channel so that
+			// it may be detected.
+			readyForLogin <- struct{}{}
+		}
+		if !loggedInBefore && conn.loggedIn {
+			// This is the signal that the connection was considered logged in, so we put a value in the channel so
+			// that it may be detected.
+			cancelContext = false
+			connected <- struct{}{}
 		}
 	}
 }
