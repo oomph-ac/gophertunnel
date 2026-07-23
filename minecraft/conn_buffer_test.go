@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
 func TestConnBufferedSendLimits(t *testing.T) {
@@ -42,6 +44,35 @@ func TestConnBufferedSendByteLimitRejectsSingleOversizedWrite(t *testing.T) {
 	}
 	if len(conn.bufferedSend) != 0 || conn.bufferedSendBytes != 0 {
 		t.Fatalf("rejected write changed queue: packets=%d bytes=%d", len(conn.bufferedSend), conn.bufferedSendBytes)
+	}
+}
+
+func TestConnBufferedSendByteLimitBoundsPacketMarshalling(t *testing.T) {
+	conn := newBufferedPacketTestConn(t)
+	conn.SetBufferedSendLimits(10, 32)
+
+	err := conn.WritePacket(&packet.Unknown{PacketID: 200, Payload: make([]byte, 1<<20)})
+	if !errors.Is(err, ErrBufferedSendLimit) {
+		t.Fatalf("WritePacket() error = %v, want ErrBufferedSendLimit", err)
+	}
+	if len(conn.bufferedSend) != 0 || conn.bufferedSendBytes != 0 {
+		t.Fatalf("rejected packet changed queue: packets=%d bytes=%d", len(conn.bufferedSend), conn.bufferedSendBytes)
+	}
+}
+
+func TestConnBufferedSendByteLimitBoundsSinglePacketMarshalling(t *testing.T) {
+	conn := newBufferedPacketTestConn(t)
+	conn.SetBufferedSendLimits(10, 32)
+	pk := &packet.Unknown{PacketID: 200, Payload: make([]byte, 1<<20)}
+
+	if err := conn.FlushSingleWithACK(pk, 1); !errors.Is(err, ErrBufferedSendLimit) {
+		t.Fatalf("FlushSingleWithACK() error = %v, want ErrBufferedSendLimit", err)
+	}
+	if err := conn.FlushSingleWithReliability(pk, 2); !errors.Is(err, ErrBufferedSendLimit) {
+		t.Fatalf("FlushSingleWithReliability() error = %v, want ErrBufferedSendLimit", err)
+	}
+	if conn.bufferedSendInFlight != 0 || conn.bufferedSendInFlightBytes != 0 {
+		t.Fatalf("rejected single packet changed in-flight usage: packets=%d bytes=%d", conn.bufferedSendInFlight, conn.bufferedSendInFlightBytes)
 	}
 }
 
@@ -109,4 +140,12 @@ func newBufferedTestConn(t *testing.T) *Conn {
 		_ = remote.Close()
 	})
 	return &Conn{ctx: context.Background(), conn: local}
+}
+
+func newBufferedPacketTestConn(t *testing.T) *Conn {
+	t.Helper()
+	conn := newBufferedTestConn(t)
+	conn.proto = proto{}
+	conn.hdr = &packet.Header{}
+	return conn
 }
