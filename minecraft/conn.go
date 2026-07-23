@@ -140,9 +140,15 @@ type Conn struct {
 	encMu sync.Mutex
 	// bufferedSend is a slice of byte slices containing packets that are 'written'. They are buffered until
 	// they are sent each 20th of a second.
-	bufferedSend      [][]byte
-	bufferedSendSpare [][]byte
-	hdr               *packet.Header
+	bufferedSend              [][]byte
+	bufferedSendSpare         [][]byte
+	bufferedSendBytes         int
+	bufferedSendInFlight      int
+	bufferedSendInFlightBytes int
+	maxBufferedSendPackets    int
+	maxBufferedSendBytes      int
+	automaticFlushDisabled    atomic.Bool
+	hdr                       *packet.Header
 
 	// readyToLogin is a bool indicating if the connection is ready to login. This is used to ensure that the client
 	// has received the relevant network settings before the login sequence starts.
@@ -247,12 +253,32 @@ func (conn *Conn) flushRoutine(d time.Duration) {
 		case <-conn.ctx.Done():
 			return
 		case <-ticker.C:
+			if conn.automaticFlushDisabled.Load() {
+				continue
+			}
 			if err := conn.Flush(); err != nil {
 				_ = conn.close(err)
 				return
 			}
 		}
 	}
+}
+
+// SetAutomaticFlushEnabled controls the flush routine configured when the
+// connection was created. Disabling automatic flushing is useful to callers
+// that must decide atomically which buffered packets are released.
+func (conn *Conn) SetAutomaticFlushEnabled(enabled bool) {
+	conn.automaticFlushDisabled.Store(!enabled)
+}
+
+// SetBufferedSendLimits limits the number and total encoded bytes of packets
+// retained by the connection, including a batch currently being encoded.
+// Non-positive values disable the corresponding limit.
+func (conn *Conn) SetBufferedSendLimits(maxPackets, maxBytes int) {
+	conn.sendMu.Lock()
+	conn.maxBufferedSendPackets = maxPackets
+	conn.maxBufferedSendBytes = maxBytes
+	conn.sendMu.Unlock()
 }
 
 func (conn *Conn) Raknet() *raknet.Conn {
@@ -393,6 +419,7 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 	}
 	conn.sendMu.Lock()
 	defer conn.sendMu.Unlock()
+	startPackets, startBytes := len(conn.bufferedSend), conn.bufferedSendBytes
 
 	buf := internal.BufferPool.Get().(*bytes.Buffer)
 	defer func() {
@@ -412,7 +439,14 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 		if conn.packetFunc != nil {
 			conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
 		}
-		conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), buf.Bytes()...))
+		if err := conn.appendBufferedSendLocked(buf.Bytes()); err != nil {
+			for i := startPackets; i < len(conn.bufferedSend); i++ {
+				conn.bufferedSend[i] = nil
+			}
+			conn.bufferedSend = conn.bufferedSend[:startPackets]
+			conn.bufferedSendBytes = startBytes
+			return conn.wrap(err, "write packet")
+		}
 	}
 	return nil
 }
@@ -564,8 +598,33 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 	conn.sendMu.Lock()
 	defer conn.sendMu.Unlock()
 
-	conn.bufferedSend = append(conn.bufferedSend, b)
+	if err := conn.checkBufferedSendLimitLocked(len(b)); err != nil {
+		return 0, conn.wrap(err, "write")
+	}
+	conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), b...))
+	conn.bufferedSendBytes += len(b)
 	return len(b), nil
+}
+
+func (conn *Conn) appendBufferedSendLocked(b []byte) error {
+	if err := conn.checkBufferedSendLimitLocked(len(b)); err != nil {
+		return err
+	}
+	conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), b...))
+	conn.bufferedSendBytes += len(b)
+	return nil
+}
+
+func (conn *Conn) checkBufferedSendLimitLocked(packetBytes int) error {
+	packets := len(conn.bufferedSend) + conn.bufferedSendInFlight
+	if max := conn.maxBufferedSendPackets; max > 0 && packets >= max {
+		return fmt.Errorf("%w: %d packets already buffered (maximum %d)", ErrBufferedSendLimit, packets, max)
+	}
+	bufferedBytes := conn.bufferedSendBytes + conn.bufferedSendInFlightBytes
+	if max := conn.maxBufferedSendBytes; max > 0 && (bufferedBytes >= max || packetBytes > max-bufferedBytes) {
+		return fmt.Errorf("%w: buffering %d bytes with %d already buffered exceeds maximum %d", ErrBufferedSendLimit, packetBytes, bufferedBytes, max)
+	}
+	return nil
 }
 
 // ReadBytes reads a packet from the connection without decoding it directly.
@@ -628,25 +687,33 @@ func (conn *Conn) Flush() error {
 	// Detach the current buffer and swap in the spare so writers can keep appending while we encode,
 	// without reallocating bufferedSend.
 	toSend := conn.bufferedSend
+	toSendBytes := conn.bufferedSendBytes
 	conn.bufferedSend = conn.bufferedSendSpare[:0]
 	conn.bufferedSendSpare = nil
+	conn.bufferedSendBytes = 0
+	conn.bufferedSendInFlight += len(toSend)
+	conn.bufferedSendInFlightBytes += toSendBytes
 	conn.sendMu.Unlock()
+	defer conn.releaseBufferedSend(toSend, toSendBytes)
 
 	if err := conn.enc.Encode(toSend); err != nil && !errors.Is(err, net.ErrClosed) {
 		// Should never happen.
 		panic(fmt.Errorf("error encoding packet batch: %w", err))
 	}
+	return nil
+}
 
+func (conn *Conn) releaseBufferedSend(toSend [][]byte, byteLen int) {
 	// Clear out toSend so that re-using the slice after resetting its length to 0 doesn't keep references
 	// to packet payloads alive, causing an 'invisible' memory leak.
 	for i := range toSend {
 		toSend[i] = nil
 	}
-
 	conn.sendMu.Lock()
+	conn.bufferedSendInFlight -= len(toSend)
+	conn.bufferedSendInFlightBytes -= byteLen
 	conn.bufferedSendSpare = toSend[:0]
 	conn.sendMu.Unlock()
-	return nil
 }
 
 // FlushSingleWithACK encodes a batch with a single packet specified to avoid flushing the current buffered send.
@@ -725,20 +792,18 @@ func (conn *Conn) flushWith(encode func([][]byte) error) error {
 		return nil
 	}
 	toSend := conn.bufferedSend
+	toSendBytes := conn.bufferedSendBytes
 	conn.bufferedSend = conn.bufferedSendSpare[:0]
 	conn.bufferedSendSpare = nil
+	conn.bufferedSendBytes = 0
+	conn.bufferedSendInFlight += len(toSend)
+	conn.bufferedSendInFlightBytes += toSendBytes
 	conn.sendMu.Unlock()
+	defer conn.releaseBufferedSend(toSend, toSendBytes)
 
 	if err := encode(toSend); err != nil && !errors.Is(err, net.ErrClosed) {
 		panic(fmt.Errorf("error encoding packet batch: %w", err))
 	}
-	for i := range toSend {
-		toSend[i] = nil
-	}
-
-	conn.sendMu.Lock()
-	conn.bufferedSendSpare = toSend[:0]
-	conn.sendMu.Unlock()
 	return nil
 }
 
