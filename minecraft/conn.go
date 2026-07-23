@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -279,7 +280,11 @@ func (conn *Conn) SetBufferedSendLimits(maxPackets, maxBytes int) {
 	conn.maxBufferedSendBytes = maxBytes
 	conn.sendMu.Unlock()
 	if raknetConn := conn.Raknet(); raknetConn != nil {
-		raknetConn.SetOutboundQueueLimits(maxPackets, maxBytes)
+		if limiter, ok := any(raknetConn).(interface {
+			SetOutboundQueueLimits(int, int)
+		}); ok {
+			limiter.SetOutboundQueueLimits(maxPackets, maxBytes)
+		}
 	}
 }
 
@@ -653,7 +658,16 @@ func (conn *Conn) marshalPacketLocked(buf *bytes.Buffer, pk packet.Packet, addit
 	if max := conn.maxBufferedSendBytes; max > 0 {
 		retained := conn.bufferedSendBytes + conn.bufferedSendInFlightBytes + additionalBytes
 		writer := protocol.NewBoundedWriter(buf, max-retained-buf.Len())
-		pk.Marshal(conn.proto.NewWriter(writer, conn.shieldID.Load()))
+		packetWriter := conn.proto.NewWriter(writer, conn.shieldID.Load())
+		pk.Marshal(packetWriter)
+		if errWriter, ok := packetWriter.(interface{ Err() error }); ok {
+			if err := errWriter.Err(); err != nil {
+				if errors.Is(err, protocol.ErrWriterLimit) {
+					return 0, fmt.Errorf("%w: %v", ErrBufferedSendLimit, err)
+				}
+				return 0, fmt.Errorf("marshal packet: %w", err)
+			}
+		}
 		if err := writer.Err(); err != nil {
 			return 0, fmt.Errorf("%w: %v", ErrBufferedSendLimit, err)
 		}

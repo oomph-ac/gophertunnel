@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
@@ -73,6 +74,22 @@ func TestConnBufferedSendByteLimitBoundsSinglePacketMarshalling(t *testing.T) {
 	}
 	if conn.bufferedSendInFlight != 0 || conn.bufferedSendInFlightBytes != 0 {
 		t.Fatalf("rejected single packet changed in-flight usage: packets=%d bytes=%d", conn.bufferedSendInFlight, conn.bufferedSendInFlightBytes)
+	}
+}
+
+func TestConnBufferedSendByteLimitRejectsNestedItemMarshalling(t *testing.T) {
+	conn := newBufferedPacketTestConn(t)
+	conn.SetBufferedSendLimits(10, 32)
+	pk := &nestedItemPacket{stack: protocol.ItemStack{
+		ItemType: protocol.ItemType{NetworkID: 1},
+		CanBreak: []string{string(make([]byte, 1<<20))},
+	}}
+
+	if err := conn.WritePacket(pk); !errors.Is(err, ErrBufferedSendLimit) {
+		t.Fatalf("WritePacket() error = %v, want ErrBufferedSendLimit", err)
+	}
+	if len(conn.bufferedSend) != 0 || conn.bufferedSendBytes != 0 {
+		t.Fatalf("rejected nested packet changed queue: packets=%d bytes=%d", len(conn.bufferedSend), conn.bufferedSendBytes)
 	}
 }
 
@@ -148,4 +165,14 @@ func newBufferedPacketTestConn(t *testing.T) *Conn {
 	conn.proto = proto{}
 	conn.hdr = &packet.Header{}
 	return conn
+}
+
+type nestedItemPacket struct {
+	stack protocol.ItemStack
+}
+
+func (*nestedItemPacket) ID() uint32 { return 200 }
+
+func (pk *nestedItemPacket) Marshal(io protocol.IO) {
+	io.Item(&pk.stack)
 }
