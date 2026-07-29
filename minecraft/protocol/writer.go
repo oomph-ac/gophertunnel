@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -16,14 +17,96 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
+type byteWriter interface {
+	io.Writer
+	io.ByteWriter
+}
+
+// ErrWriterLimit is returned when a bounded protocol writer would exceed its
+// configured encoded-byte budget.
+var ErrWriterLimit = errors.New("protocol writer byte limit exceeded")
+
+// BoundedWriter enforces an encoded-byte budget around a protocol byte writer.
+type BoundedWriter struct {
+	w         byteWriter
+	remaining int
+	err       error
+}
+
+// NewBoundedWriter returns a writer that accepts at most max bytes.
+func NewBoundedWriter(w byteWriter, max int) *BoundedWriter {
+	return &BoundedWriter{w: w, remaining: max}
+}
+
+func (w *BoundedWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if len(p) > w.remaining {
+		w.err = ErrWriterLimit
+		return 0, w.err
+	}
+	n, err := w.w.Write(p)
+	w.remaining -= n
+	if n != len(p) && err == nil {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+func (w *BoundedWriter) WriteByte(b byte) error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.remaining <= 0 {
+		w.err = ErrWriterLimit
+		return w.err
+	}
+	if err := w.w.WriteByte(b); err != nil {
+		w.err = err
+		return err
+	}
+	w.remaining--
+	return nil
+}
+
+func (w *BoundedWriter) WriteString(s string) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if len(s) > w.remaining {
+		w.err = ErrWriterLimit
+		return 0, w.err
+	}
+	n, err := io.WriteString(w.w, s)
+	w.remaining -= n
+	if n != len(s) && err == nil {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+// Remaining returns the number of bytes the writer may still accept.
+func (w *BoundedWriter) Remaining() int { return w.remaining }
+
+// Err returns the first limit or underlying write error.
+func (w *BoundedWriter) Err() error { return w.err }
+
 // Writer implements writing methods for data types from Minecraft packets. Each Packet implementation has one
 // passed to it when writing.
 // Writer implements methods where values are passed using a pointer, so that Reader and Writer have a
 // synonymous interface and both implement the IO interface.
 type Writer struct {
-	w        *bytes.Buffer
+	w        byteWriter
 	shieldID int32
 	buf      [8]byte
+	err      error
 }
 
 // NewWriter creates a new initialised Writer with an underlying io.ByteWriter to write to.
@@ -31,7 +114,26 @@ func NewWriter(w interface {
 	io.Writer
 	io.ByteWriter
 }, shieldID int32) *Writer {
-	return &Writer{w: w.(*bytes.Buffer), shieldID: shieldID}
+	return &Writer{w: w, shieldID: shieldID}
+}
+
+// Err returns the first error encountered by this writer or its bounded
+// underlying writer.
+func (w *Writer) Err() error {
+	if w.err != nil {
+		return w.err
+	}
+	if errWriter, ok := w.w.(interface{ Err() error }); ok {
+		return errWriter.Err()
+	}
+	return nil
+}
+
+func (w *Writer) childWriter(buf *bytes.Buffer) *Writer {
+	if remaining, ok := w.w.(interface{ Remaining() int }); ok {
+		return NewWriter(NewBoundedWriter(buf, remaining.Remaining()), w.shieldID)
+	}
+	return NewWriter(buf, w.shieldID)
 }
 
 // Uint8 writes a uint8 to the underlying buffer.
@@ -65,7 +167,7 @@ func (w *Writer) String(x *string) {
 
 // writeString writes s directly to the underlying byte buffer.
 func (w *Writer) writeString(s string) {
-	_, _ = w.w.WriteString(s)
+	_, _ = io.WriteString(w.w, s)
 }
 
 // ByteSlice writes a []byte, prefixed with a varuint32, to the underlying buffer.
@@ -357,11 +459,13 @@ func (w *Writer) ItemInstance(i *ItemInstance) {
 	buf := internal.BufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer func() {
-		buf.Reset()
-		internal.BufferPool.Put(buf)
+		if buf.Cap() <= 1<<20 {
+			buf.Reset()
+			internal.BufferPool.Put(buf)
+		}
 	}()
 
-	bufWriter := NewWriter(buf, w.shieldID)
+	bufWriter := w.childWriter(buf)
 
 	var length int16
 	if len(x.NBTData) != 0 {
@@ -380,6 +484,10 @@ func (w *Writer) ItemInstance(i *ItemInstance) {
 
 	if x.NetworkID == bufWriter.shieldID {
 		bufWriter.Int64(&x.BlockingTick)
+	}
+	if err := bufWriter.Err(); err != nil {
+		w.err = err
+		return
 	}
 
 	b := buf.Bytes()
@@ -416,11 +524,13 @@ func (w *Writer) ItemInstanceNew(i *ItemInstance) {
 	buf := internal.BufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer func() {
-		buf.Reset()
-		internal.BufferPool.Put(buf)
+		if buf.Cap() <= 1<<20 {
+			buf.Reset()
+			internal.BufferPool.Put(buf)
+		}
 	}()
 
-	bufWriter := NewWriter(buf, w.shieldID)
+	bufWriter := w.childWriter(buf)
 
 	var length int16
 	if len(x.NBTData) != 0 {
@@ -439,6 +549,10 @@ func (w *Writer) ItemInstanceNew(i *ItemInstance) {
 
 	if x.NetworkID == bufWriter.shieldID {
 		bufWriter.Int64(&x.BlockingTick)
+	}
+	if err := bufWriter.Err(); err != nil {
+		w.err = err
+		return
 	}
 
 	b := buf.Bytes()
@@ -460,11 +574,13 @@ func (w *Writer) Item(x *ItemStack) {
 	buf := internal.BufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer func() {
-		buf.Reset()
-		internal.BufferPool.Put(buf)
+		if buf.Cap() <= 1<<20 {
+			buf.Reset()
+			internal.BufferPool.Put(buf)
+		}
 	}()
 
-	bufWriter := NewWriter(buf, w.shieldID)
+	bufWriter := w.childWriter(buf)
 
 	var length int16
 	if len(x.NBTData) != 0 {
@@ -483,6 +599,10 @@ func (w *Writer) Item(x *ItemStack) {
 
 	if x.NetworkID == bufWriter.shieldID {
 		bufWriter.Int64(&x.BlockingTick)
+	}
+	if err := bufWriter.Err(); err != nil {
+		w.err = err
+		return
 	}
 
 	extraData := buf.Bytes()
@@ -667,6 +787,10 @@ func (w *Writer) Varuint32(x *uint32) {
 // NBT writes a map as NBT to the underlying buffer using the encoding passed.
 func (w *Writer) NBT(x *map[string]any, encoding nbt.Encoding) {
 	if err := nbt.NewEncoderWithEncoding(w.w, encoding).Encode(*x); err != nil {
+		if errors.Is(err, ErrWriterLimit) {
+			w.err = err
+			return
+		}
 		panic(err)
 	}
 }
@@ -674,6 +798,10 @@ func (w *Writer) NBT(x *map[string]any, encoding nbt.Encoding) {
 // NBTList writes a slice as NBT to the underlying buffer using the encoding passed.
 func (w *Writer) NBTList(x *[]any, encoding nbt.Encoding) {
 	if err := nbt.NewEncoderWithEncoding(w.w, encoding).Encode(*x); err != nil {
+		if errors.Is(err, ErrWriterLimit) {
+			w.err = err
+			return
+		}
 		panic(err)
 	}
 }
