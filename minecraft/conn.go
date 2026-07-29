@@ -887,8 +887,11 @@ func (conn *Conn) takeDeferredPackets() ([]*packetData, bool) {
 }
 
 // deferPacket defers a packet so that it is obtained in the next ReadPacket call
-func (conn *Conn) deferPacket(_ *packetData) {
-	// Drop packets that arrive out of sequence instead of retaining attacker-controlled data during login.
+func (conn *Conn) deferPacket(pk *packetData) {
+	conn.deferredPacketMu.Lock()
+	defer conn.deferredPacketMu.Unlock()
+
+	conn.deferredPackets = append(conn.deferredPackets, pk)
 }
 
 // receive receives an incoming serialised packet from the underlying connection. If the connection is not yet
