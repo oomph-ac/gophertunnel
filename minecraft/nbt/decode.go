@@ -254,13 +254,12 @@ func (d *Decoder) unmarshalTag(val reflect.Value, t tagType, tagName string) err
 		if err != nil {
 			return err
 		}
-
 		if length < 0 {
 			return InvalidLengthError{Off: d.r.off, Op: "ByteArray", N: int(length)}
-		} else if int(length) > d.r.Reader.Len() {
-			return BufferOverrunError{Op: "ByteArray"}
 		}
-
+		if err = d.checkRemaining(int(length), "ByteArray"); err != nil {
+			return err
+		}
 		b := make([]byte, length)
 		if _, err := d.r.Read(b); err != nil {
 			return BufferOverrunError{Op: "ByteArray"}
@@ -343,13 +342,14 @@ func (d *Decoder) unmarshalTag(val reflect.Value, t tagType, tagName string) err
 			}
 			if length < 0 {
 				return InvalidLengthError{Off: d.r.off, Op: "ByteSlice", N: int(length)}
-			} else if int(length) > d.r.Reader.Len() {
-				return BufferOverrunError{Op: "ByteSlice"}
 			}
 			if length == 0 {
 				// Empty lists are allowed to have the TAG_Byte type.
 				val.Set(reflect.MakeSlice(sliceType, int(length), int(length)))
 				break
+			}
+			if err = d.checkRemaining(int(length), "ByteSlice"); err != nil {
+				return err
 			}
 			b := make([]byte, length)
 			if _, err := d.r.Read(b); err != nil {
@@ -390,10 +390,12 @@ func (d *Decoder) unmarshalTag(val reflect.Value, t tagType, tagName string) err
 			}
 			if length < 0 {
 				return InvalidLengthError{Off: d.r.off, Op: "List", N: int(length)}
-			} else if int(length) > d.r.Reader.Len() {
-				return BufferOverrunError{Op: "List"}
 			}
-
+			// Every element takes up at least a byte, so a list longer than the
+			// remaining data can never be valid.
+			if err = d.checkRemaining(int(length), "List"); err != nil {
+				return err
+			}
 			v := reflect.MakeSlice(sliceType, int(length), int(length))
 			for i := 0; i < int(length); i++ {
 				if err := d.unmarshalTag(v.Index(i), listType, ""); err != nil {
@@ -545,6 +547,13 @@ func (d *Decoder) tag() (t tagType, tagName string, err error) {
 		tagName, err = d.Encoding.String(d.r)
 	}
 	return t, tagName, err
+}
+
+func (d *Decoder) checkRemaining(length int, op string) error {
+	if length > d.r.Reader.Len() {
+		return BufferOverrunError{Op: op}
+	}
+	return nil
 }
 
 // isAny checks if a reflect.Value has the type `any` or `interface{}`.
