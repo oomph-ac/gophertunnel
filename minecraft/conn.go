@@ -1075,6 +1075,10 @@ func (conn *Conn) receiveMultiple(frames [][]byte) error {
 				continue
 			}
 
+			if !conn.loggedIn || conn.waitingForSpawn.Load() {
+				conn.deferPacket(pkData)
+				continue
+			}
 			// Not an expected packet: Forward to the batch for user consumption.
 			batch = append(batch, pkData)
 		}
