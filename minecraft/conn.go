@@ -1666,6 +1666,7 @@ func (conn *Conn) handleResourcePackDataInfo(pk *packet.ResourcePackDataInfo) er
 				UUID:       idCopy,
 				ChunkIndex: i,
 			})
+			_ = conn.Flush()
 			select {
 			case <-conn.ctx.Done():
 				return
@@ -1697,6 +1698,7 @@ func (conn *Conn) handleResourcePackDataInfo(pk *packet.ResourcePackDataInfo) er
 		if packAmount == 0 {
 			conn.expect(packet.IDResourcePackStack)
 			_ = conn.WritePacket(&packet.ResourcePackClientResponse{Response: packet.PackResponseAllPacksDownloaded})
+			_ = conn.Flush()
 		}
 		conn.storeResourcePack(pack.cacheKey, newPack)
 	}()
