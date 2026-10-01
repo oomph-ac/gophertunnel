@@ -67,6 +67,12 @@ func ReadURL(url string) (*Pack, error) {
 	return pack, nil
 }
 
+// SetDownloadURL sets the URL that the client will download this pack from
+// instead of receiving it in chunks over the network.
+func (pack *Pack) SetDownloadURL(url string) {
+	pack.downloadURL = url
+}
+
 // MustReadPath compiles a resource pack found at the path passed. The resource pack must either be a zip
 // archive (extension does not matter, could be .zip or .mcpack), or a directory containing a resource pack.
 // In the case of a directory, the directory is compiled into an archive and the pack is parsed from that.

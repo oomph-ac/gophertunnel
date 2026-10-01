@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -76,6 +77,51 @@ func (e *AuthorizationEnvironment) httpClient() *http.Client {
 		return e.HTTPClient
 	}
 	return http.DefaultClient
+}
+
+// HTTPClient returns a client that routes around a Front Door anycast
+// address that sometimes blackholes raw IPv4 connections. It is opt-in: pass
+// it as the Dialer's HTTPClient (and as AuthorizationEnvironment.HTTPClient)
+// to use it. The default clients do not use it.
+func HTTPClient() *http.Client {
+	return fallbackClient
+}
+
+// fallbackClient routes the Minecraft authorization hosts to a fixed, known
+// good Front Door address. The Host header and TLS SNI stay on the original
+// hostname.
+var fallbackClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err == nil && blackholed(ctx, host) {
+				addr = "150.171.109.116:" + port
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	},
+}
+
+// blackholed reports whether host is known to sit behind the problematic
+// Front Door farm, or resolves to its dead anycast address.
+func blackholed(ctx context.Context, host string) bool {
+	if host == "multiplayer.minecraft.net" ||
+		strings.HasSuffix(host, "minecraft-services.net") ||
+		strings.HasSuffix(host, "playfabapi.com") {
+		return true
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return false
+	}
+	dead := net.ParseIP("150.171.109.119")
+	for _, ip := range ips {
+		if ip.IP.Equal(dead) {
+			return true
+		}
+	}
+	return false
 }
 
 // ServiceName implements [service.Environment.ServiceName] and returns "auth".
