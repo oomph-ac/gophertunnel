@@ -355,6 +355,24 @@ func (w *Writer) EntityMetadata(x *EntityMetadata) {
 		case mgl32.Vec3:
 			writeType(EntityDataTypeVec3)
 			w.Vec3(&v)
+		case float64:
+			if key == EntityDataKeyFlags || key == EntityDataKeyFlagsTwo || v == float64(int64(v)) {
+				i := int64(v)
+				writeType(EntityDataTypeInt64)
+				w.Varint64(&i)
+			} else {
+				f := float32(v)
+				writeType(EntityDataTypeFloat32)
+				w.Float32(&f)
+			}
+		case int:
+			i := int64(v)
+			writeType(EntityDataTypeInt64)
+			w.Varint64(&i)
+		case uint64:
+			i := int64(v)
+			writeType(EntityDataTypeInt64)
+			w.Varint64(&i)
 		default:
 			w.UnknownEnumOption(reflect.TypeOf(value), "entity metadata")
 		}

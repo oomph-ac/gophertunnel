@@ -147,7 +147,13 @@ func (err InvalidStringError) Error() string {
 	return fmt.Sprintf("nbt: string at offset %v is not valid: %v (len=%v)", err.Off, err.Err, err.N)
 }
 
-const maximumNestingDepth = 512
+// maximumNestingDepth is a var so a harness can lift the cap when it
+// deliberately sends deeper NBT than a normal server would.
+var maximumNestingDepth = 512
+
+// SetMaximumNestingDepth sets the cap on compound/list NBT nesting for both
+// reading and writing. Call it once at startup, before any traffic.
+func SetMaximumNestingDepth(n int) { maximumNestingDepth = n }
 
 // MaximumDepthReachedError is returned if the maximum depth of 512 compound/list tags has been reached while
 // reading or writing NBT.
